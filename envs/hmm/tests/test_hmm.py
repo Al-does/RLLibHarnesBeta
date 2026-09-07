@@ -641,9 +641,104 @@ def test_edge_reset_and_action_conditioned_filter_with_scrambling():
         assert reward == scrambled_reward
 
 
-def test_edge_neutral_fallback_delay_and_inconsistent_decisions():
-    with pytest.raises(ValueError, match="delay=0"):
-        HMMEnv(edge_env_config(delay=1))
+def test_edge_delay_one_delivers_previous_token_and_filters_exactly():
+    env = HMMEnv(
+        edge_env_config(
+            delay=1,
+            observation={"action": None},
+            episode_length=32,
+        )
+    )
+    observation, info = env.reset(seed=7)
+    model = env.model
+    np.testing.assert_array_equal(observation, np.zeros(model.n_tokens))
+    assert info["visible_token_current"] is None
+    assert info["visible_source_token"] is None
+    expected = model.initial_distribution @ model.transition_matrix
+    np.testing.assert_allclose(info["belief_current"], expected)
+    np.testing.assert_allclose(info["raw_belief_current"], expected)
+
+    source_belief = model.initial_distribution
+    pending_edges = model.edge_transition_matrices
+    for action in [0, 1, 1, 0]:
+        token_before = info["raw_token_current"]
+        observation, _, _, _, info = env.step(action)
+        executed_edges = info["executed_edge_transition_matrices"]
+        source_belief = condition_edge(
+            source_belief,
+            pending_edges,
+            token_before,
+        )
+        expected = source_belief @ executed_edges.sum(axis=0)
+        assert info["visible_token_current"] == token_before
+        assert info["visible_source_token"] == token_before
+        np.testing.assert_array_equal(
+            observation,
+            np.eye(model.n_tokens, dtype=np.float32)[token_before],
+        )
+        np.testing.assert_allclose(info["belief_current"], expected)
+        np.testing.assert_allclose(info["raw_belief_current"], expected)
+        pending_edges = executed_edges
+
+
+def test_edge_delay_one_scrambling_preserves_latent_path_and_raw_belief():
+    def trace(mode):
+        env = HMMEnv(
+            edge_env_config(
+                delay=1,
+                observation={
+                    "action": None,
+                    "token_scrambling": mode,
+                },
+                episode_length=64,
+            )
+        )
+        _, info = env.reset(seed=19)
+        output = []
+        for action in [0, 1] * 16:
+            observation, _, _, _, info = env.step(action)
+            output.append(
+                (
+                    info["state_current"],
+                    info["raw_token_current"],
+                    info["visible_source_token"],
+                    observation.copy(),
+                    info["belief_current"].copy(),
+                    info["raw_belief_current"].copy(),
+                )
+            )
+        return output
+
+    plain = trace("none")
+    scrambled = trace("uniform")
+    assert [
+        (state, raw_token, visible_source)
+        for state, raw_token, visible_source, _, _, _ in plain
+    ] == [
+        (state, raw_token, visible_source)
+        for state, raw_token, visible_source, _, _, _ in scrambled
+    ]
+    np.testing.assert_allclose(
+        [raw_belief for *_, raw_belief in plain],
+        [raw_belief for *_, raw_belief in scrambled],
+    )
+    assert any(
+        not np.array_equal(plain_observation, scrambled_observation)
+        for (
+            (_, _, _, plain_observation, _, _),
+            (_, _, _, scrambled_observation, _, _),
+        ) in zip(plain, scrambled)
+    )
+    assert any(
+        not np.allclose(plain_belief, scrambled_belief)
+        for (
+            (_, _, _, _, plain_belief, _),
+            (_, _, _, _, scrambled_belief, _),
+        ) in zip(plain, scrambled)
+    )
+
+
+def test_edge_neutral_fallback_and_inconsistent_decisions():
     env = HMMEnv(edge_env_config(task={"class": f"{__name__}:InlineGuessTask"}))
     env.reset(seed=7)
     _, _, _, _, info = env.step(0)
