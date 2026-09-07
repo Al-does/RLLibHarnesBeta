@@ -11,8 +11,8 @@ from typing import Any, Protocol
 import gymnasium as gym
 import numpy as np
 
-from envs.hmm.belief import BeliefTracker
-from envs.hmm.model import HMMModel
+from envs.hmm.belief import BeliefTracker, condition_edge
+from envs.hmm.model import HMMModel, validate_edge_transition_matrices
 
 
 _ENVIRONMENT_STREAM_KEYS = {
@@ -178,6 +178,7 @@ class ActionDecision:
     executed_action: Any
     transition_matrix: np.ndarray
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    edge_transition_matrices: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +287,8 @@ class HMMEnv(gym.Env):
         if not isinstance(model, HMMModel):
             raise TypeError("the configured model factory must return HMMModel")
         self.model = model
+        if model.edge_transition_matrices is not None and self.config.delay != 0:
+            raise ValueError("edge-emitting models currently require delay=0")
 
         task_class, task_kwargs = _component(
             self.config.task,
@@ -492,7 +495,36 @@ class HMMEnv(gym.Env):
             self._visible_source_token
         )
 
+    def _sample_edge(self, matrices: np.ndarray) -> None:
+        probabilities = matrices[:, self._state, :]
+        self._raw_token = self._sample(
+            self._emission_rng, probabilities.sum(axis=1)
+        )
+        destination = probabilities[self._raw_token]
+        self._state = self._sample(
+            self._state_rng, destination / destination.sum()
+        )
+
+    def _advance_edge_beliefs(self, matrices: np.ndarray) -> None:
+        if self._belief_tracker is not None:
+            visible_matrices = np.einsum(
+                "xij,xy->yij", matrices, self._token_confusion
+            )
+            self._belief_tracker.belief = condition_edge(
+                self._belief_tracker.belief, visible_matrices, self._visible_token
+            )
+        if self._raw_belief_tracker is not None:
+            self._raw_belief_tracker.belief = condition_edge(
+                self._raw_belief_tracker.belief, matrices, self._raw_token
+            )
+
     def _reset_beliefs(self) -> None:
+        if self.model.edge_transition_matrices is not None:
+            for tracker in (self._belief_tracker, self._raw_belief_tracker):
+                if tracker is not None:
+                    tracker.reset()
+            self._advance_edge_beliefs(self.model.edge_transition_matrices)
+            return
         if self._belief_tracker is not None:
             if self.config.delay == 0:
                 assert self._visible_token is not None
@@ -677,10 +709,13 @@ class HMMEnv(gym.Env):
             self._state_rng,
             self.model.initial_distribution,
         )
-        self._raw_token = self._sample(
-            self._emission_rng,
-            self.model.emission_matrix[self._state],
-        )
+        if self.model.edge_transition_matrices is None:
+            self._raw_token = self._sample(
+                self._emission_rng,
+                self.model.emission_matrix[self._state],
+            )
+        else:
+            self._sample_edge(self.model.edge_transition_matrices)
         self._reset_token_delivery()
         self._reset_beliefs()
         self._history.clear()
@@ -722,20 +757,34 @@ class HMMEnv(gym.Env):
             decision.transition_matrix
         )
 
-        self._state = self._sample(
-            self._state_rng,
-            transition_matrix[state_before],
-        )
-        self._raw_token = self._sample(
-            self._emission_rng,
-            self.model.emission_matrix[self._state],
-        )
+        edge_matrices = decision.edge_transition_matrices
+        if self.model.edge_transition_matrices is None:
+            if edge_matrices is not None:
+                raise ValueError("edge decisions require an edge-emitting model")
+            self._state = self._sample(
+                self._state_rng,
+                transition_matrix[state_before],
+            )
+            self._raw_token = self._sample(
+                self._emission_rng,
+                self.model.emission_matrix[self._state],
+            )
+        else:
+            if edge_matrices is None:
+                edge_matrices = self.model.edge_transition_matrices
+            edge_matrices = validate_edge_transition_matrices(
+                edge_matrices, transition_matrix, self.model.n_tokens
+            )
+            self._sample_edge(edge_matrices)
         self._advance_token_delivery(self._raw_token)
-        self._advance_beliefs(
-            transition_matrix,
-            raw_token_before=raw_token_before,
-            raw_token_after=self._raw_token,
-        )
+        if edge_matrices is None:
+            self._advance_beliefs(
+                transition_matrix,
+                raw_token_before=raw_token_before,
+                raw_token_after=self._raw_token,
+            )
+        else:
+            self._advance_edge_beliefs(edge_matrices)
         belief_after = (
             None
             if not self._task_requires_belief
@@ -803,6 +852,11 @@ class HMMEnv(gym.Env):
                     ),
                 }
             )
+            if edge_matrices is not None:
+                info["original_edge_transition_matrices"] = (
+                    self.model.edge_transition_matrices.copy()
+                )
+                info["executed_edge_transition_matrices"] = edge_matrices.copy()
             reference_matrix = decision.metadata.get(
                 "reference_transition_matrix"
             )

@@ -33,6 +33,24 @@ def _validate_row_stochastic(value: np.ndarray, *, name: str) -> None:
         raise ValueError(f"each row of {name} must sum to one")
 
 
+def validate_edge_transition_matrices(
+    value: np.ndarray,
+    transition_matrix: np.ndarray,
+    n_tokens: int,
+) -> np.ndarray:
+    matrices = np.asarray(value, dtype=np.float64)
+    expected = (n_tokens, *transition_matrix.shape)
+    if matrices.shape != expected:
+        raise ValueError(f"edge_transition_matrices must have shape {expected}")
+    if not np.isfinite(matrices).all() or (matrices < 0.0).any():
+        raise ValueError("edge_transition_matrices must be finite and non-negative")
+    if not np.allclose(
+        matrices.sum(axis=0), transition_matrix, atol=1e-12, rtol=0.0
+    ):
+        raise ValueError("edge_transition_matrices must sum to transition_matrix")
+    return matrices
+
+
 @dataclass(frozen=True, slots=True)
 class HMMModel:
     """Finite HMM definition independent of tasks, actions, and rewards."""
@@ -42,6 +60,7 @@ class HMMModel:
     emission_matrix: np.ndarray
     state_labels: tuple[str, ...] | None = None
     token_labels: tuple[str, ...] | None = None
+    edge_transition_matrices: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         initial = _probability_array(
@@ -85,6 +104,20 @@ class HMMModel:
             and len(self.token_labels) != emission.shape[1]
         ):
             raise ValueError("token_labels must match the number of tokens")
+
+        if self.edge_transition_matrices is not None:
+            edges = validate_edge_transition_matrices(
+                self.edge_transition_matrices, transition, emission.shape[1]
+            ).copy()
+            if not np.allclose(
+                edges.sum(axis=2).T, emission, atol=1e-12, rtol=0.0
+            ):
+                raise ValueError(
+                    "emission_matrix must equal edge_transition_matrices "
+                    "summed over destinations and transposed"
+                )
+            edges.setflags(write=False)
+            object.__setattr__(self, "edge_transition_matrices", edges)
 
         initial.setflags(write=False)
         transition.setflags(write=False)

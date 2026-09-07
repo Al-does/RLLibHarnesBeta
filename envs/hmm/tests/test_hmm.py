@@ -17,6 +17,7 @@ from envs.hmm import (
     HMMModel,
     TransitionEvent,
     compose_hmm_factors,
+    condition_edge,
     factor_marginals,
     factored_model,
     measure,
@@ -523,3 +524,197 @@ def test_diagnostics_are_opt_in(make_env):
     assert reset_info == {"decision_step": 0}
     _, _, _, _, step_info = env.step(0)
     assert step_info == {"decision_step": 1}
+
+
+def edge_model_factory(*, deterministic=False) -> HMMModel:
+    edges = np.array([[[0.2, 0.3], [0.1, 0.1]], [[0.4, 0.1], [0.2, 0.6]]])
+    if deterministic:
+        edges = np.array([[[0, 1], [0, 0]], [[0, 0], [1, 0]]])
+    return HMMModel(
+        initial_distribution=np.array([1.0, 0.0] if deterministic else [0.75, 0.25]),
+        transition_matrix=edges.sum(axis=0),
+        emission_matrix=edges.sum(axis=2).T,
+        edge_transition_matrices=edges,
+    )
+
+
+class InlineEdgeTask(InlineGuessTask):
+    def resolve_action(self, action, state, model):
+        control = np.eye(model.n_states) if action == 0 else np.eye(model.n_states)[::-1]
+        edges = model.edge_transition_matrices @ control
+        return ActionDecision(action, action, edges.sum(axis=0), edge_transition_matrices=edges)
+
+
+def edge_env_config(**overrides):
+    return {
+        "model": {"factory": f"{__name__}:edge_model_factory"},
+        "task": {"class": f"{__name__}:InlineEdgeTask"},
+        "diagnostics": FULL_DIAGNOSTICS,
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize("change", ["shape", "negative", "nan", "transition", "emission"])
+def test_edge_model_validates_probability_contract(change):
+    model = edge_model_factory()
+    edges = model.edge_transition_matrices.copy()
+    transition = model.transition_matrix.copy()
+    emission = model.emission_matrix.copy()
+    if change == "shape":
+        edges = edges[:1]
+    elif change == "negative":
+        edges[0, 0, 0] = -0.1
+    elif change == "nan":
+        edges[0, 0, 0] = np.nan
+    elif change == "transition":
+        transition = np.eye(2)
+    else:
+        emission = np.eye(2)
+    with pytest.raises(ValueError, match="edge_transition_matrices"):
+        HMMModel(model.initial_distribution, transition, emission, edge_transition_matrices=edges)
+
+
+def test_edge_model_owns_immutable_copy_and_exact_filter():
+    model = edge_model_factory()
+    edges = model.edge_transition_matrices.copy()
+    copied = HMMModel(
+        model.initial_distribution, model.transition_matrix, model.emission_matrix,
+        edge_transition_matrices=edges,
+    )
+    edges[:] = 0
+    np.testing.assert_array_equal(copied.edge_transition_matrices, model.edge_transition_matrices)
+    assert not copied.edge_transition_matrices.flags.writeable
+    expected = model.initial_distribution @ model.edge_transition_matrices[0]
+    np.testing.assert_allclose(
+        condition_edge(model.initial_distribution, model.edge_transition_matrices, 0),
+        expected / expected.sum(),
+    )
+    with pytest.raises(ValueError, match="zero probability"):
+        condition_edge(model.initial_distribution, edges, 0)
+    with pytest.raises(ValueError, match="observation"):
+        condition_edge(model.initial_distribution, model.edge_transition_matrices, 2)
+    with pytest.raises(ValueError, match="shape"):
+        condition_edge(model.initial_distribution, np.zeros((2, 3, 3)), 0)
+
+
+def test_edge_reset_executes_a_neutral_edge_before_first_decision():
+    env = HMMEnv(edge_env_config(model={
+        "factory": f"{__name__}:edge_model_factory", "kwargs": {"deterministic": True}
+    }))
+    observation, info = env.reset(seed=11)
+    assert info["state_current"] == 1
+    assert info["raw_token_current"] == 0
+    assert info["decision_step"] == 0
+    np.testing.assert_array_equal(info["belief_current"], [0, 1])
+    np.testing.assert_array_equal(observation[-2:], [0, 0])
+    _, _, _, _, info = env.step(0)
+    assert info["state_before"] == 1
+    assert info["state_after"] == 0
+    assert info["raw_token_after"] == 1
+    np.testing.assert_array_equal(info["belief_current"], [1, 0])
+
+
+def test_edge_reset_and_action_conditioned_filter_with_scrambling():
+    plain = HMMEnv(edge_env_config())
+    scrambled = HMMEnv(edge_env_config(observation={"token_scrambling": "uniform"}))
+    _, info = plain.reset(seed=59)
+    _, scrambled_info = scrambled.reset(seed=59)
+    model = plain.model
+    belief = model.initial_distribution @ model.edge_transition_matrices[info["raw_token_current"]]
+    belief /= belief.sum()
+    scrambled_belief = model.initial_distribution @ model.transition_matrix
+    np.testing.assert_allclose(info["belief_current"], belief)
+    np.testing.assert_allclose(scrambled_info["belief_current"], scrambled_belief)
+    for action in [0, 1, 1, 0] * 20:
+        _, reward, _, _, info = plain.step(action)
+        _, scrambled_reward, _, _, scrambled_info = scrambled.step(action)
+        edges = info["executed_edge_transition_matrices"]
+        belief = belief @ edges[info["raw_token_current"]]
+        belief /= belief.sum()
+        scrambled_belief = scrambled_belief @ edges.sum(axis=0)
+        np.testing.assert_allclose(info["belief_current"], belief)
+        np.testing.assert_allclose(info["raw_belief_current"], belief)
+        np.testing.assert_allclose(scrambled_info["belief_current"], scrambled_belief)
+        np.testing.assert_allclose(scrambled_info["raw_belief_current"], belief)
+        assert info["state_current"] == scrambled_info["state_current"]
+        assert info["raw_token_current"] == scrambled_info["raw_token_current"]
+        assert reward == scrambled_reward
+
+
+def test_edge_neutral_fallback_delay_and_inconsistent_decisions():
+    with pytest.raises(ValueError, match="delay=0"):
+        HMMEnv(edge_env_config(delay=1))
+    env = HMMEnv(edge_env_config(task={"class": f"{__name__}:InlineGuessTask"}))
+    env.reset(seed=7)
+    _, _, _, _, info = env.step(0)
+    np.testing.assert_array_equal(info["executed_edge_transition_matrices"], env.model.edge_transition_matrices)
+    env.task.resolve_action = lambda *args: ActionDecision(0, 0, np.eye(2))
+    with pytest.raises(ValueError, match="sum to transition_matrix"):
+        env.step(0)
+    env.task.resolve_action = lambda *args: ActionDecision(
+        0, 0, env.model.transition_matrix, edge_transition_matrices=np.zeros((2, 2, 2))
+    )
+    with pytest.raises(ValueError, match="sum to transition_matrix"):
+        env.step(0)
+    state_env = HMMEnv(edge_env_config(model={"factory": f"{__name__}:tiny_model_factory"}))
+    state_env.reset(seed=7)
+    state_env.task.resolve_action = env.task.resolve_action
+    with pytest.raises(ValueError, match="edge-emitting model"):
+        state_env.step(0)
+
+
+def test_edge_factor_composition_and_token_aggregation():
+    factor = edge_model_factory()
+    joint = compose_hmm_factors([factor, factor])
+    for first, second in np.ndindex(2, 2):
+        np.testing.assert_allclose(
+            joint.edge_transition_matrices[first * 2 + second],
+            np.kron(factor.edge_transition_matrices[first], factor.edge_transition_matrices[second]),
+        )
+    mapping = [[0, 1], [1, 0]]
+    merged = compose_hmm_factors([factor, factor], token_map=mapping)
+    np.testing.assert_allclose(merged.edge_transition_matrices[0], joint.edge_transition_matrices[[0, 3]].sum(axis=0))
+    np.testing.assert_allclose(merged.edge_transition_matrices[1], joint.edge_transition_matrices[[1, 2]].sum(axis=0))
+    with pytest.raises(ValueError, match="cannot mix"):
+        compose_hmm_factors([factor, tiny_model_factory()])
+    with pytest.raises(ValueError, match="directed couplings"):
+        compose_hmm_factors([factor, factor], couplings=[{
+            "parent": 0, "child": 1, "transition_matrices": [np.eye(2), np.eye(2)]
+        }])
+
+
+def test_edge_simulation_matches_joint_token_destination_probabilities():
+    env = HMMEnv(edge_env_config(
+        diagnostics={"state": True, "tokens": True, "transitions": True},
+        observation={"action": None}, episode_length=20000,
+    ))
+    env.reset(seed=63)
+    counts = np.zeros((2, 2, 2, 2))
+    visits = np.zeros((2, 2))
+    for step in range(20000):
+        action = step % 2
+        _, _, _, _, info = env.step(action)
+        source = info["state_before"]
+        visits[action, source] += 1
+        counts[action, info["raw_token_after"], source, info["state_after"]] += 1
+    for action in range(2):
+        expected = env.task.resolve_action(action, 0, env.model).edge_transition_matrices
+        np.testing.assert_allclose(counts[action] / visits[action, :, None], expected, atol=0.02)
+
+
+def test_edge_hmm_rllib_env_runner_integration():
+    from ray.rllib.algorithms.ppo import PPOConfig
+    from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
+
+    config = (
+        PPOConfig()
+        .environment(HMMEnv, env_config=edge_env_config(episode_length=8))
+        .env_runners(num_env_runners=0, rollout_fragment_length=16)
+        .rl_module(model_config={"fcnet_hiddens": [8]})
+    )
+    runner = SingleAgentEnvRunner(config=config)
+    try:
+        episodes = runner.sample(num_timesteps=16)
+        assert sum(len(episode) for episode in episodes) == 16
+    finally:
+        runner.stop()

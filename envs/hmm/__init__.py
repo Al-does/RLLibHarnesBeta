@@ -1,6 +1,8 @@
 """Reusable finite discrete hidden-Markov-model environment."""
 
-from envs.hmm.belief import BeliefTracker, advance_belief, measure, predict
+from envs.hmm.belief import (
+    BeliefTracker, advance_belief, condition_edge, measure, predict,
+)
 from envs.hmm.env import (
     ActionDecision,
     DiagnosticsConfig,
@@ -36,6 +38,7 @@ __all__ = [
     "advance_belief",
     "cartesian_token_map",
     "compose_hmm_factors",
+    "condition_edge",
     "factor_marginals",
     "factored_model",
     "measure",

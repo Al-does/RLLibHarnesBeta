@@ -36,6 +36,26 @@ def predict(belief: np.ndarray, transition_matrix: np.ndarray) -> np.ndarray:
     return prior @ matrix
 
 
+def condition_edge(
+    belief: np.ndarray,
+    edge_transition_matrices: np.ndarray,
+    observation: int,
+) -> np.ndarray:
+    prior = np.asarray(belief, dtype=np.float64)
+    matrices = np.asarray(edge_transition_matrices, dtype=np.float64)
+    if prior.ndim != 1 or matrices.ndim != 3 or matrices.shape[1:] != (
+        prior.size, prior.size
+    ):
+        raise ValueError("edge_transition_matrices has the wrong shape for this belief")
+    if not 0 <= observation < matrices.shape[0]:
+        raise ValueError("observation index is outside the edge kernels")
+    posterior = prior @ matrices[observation]
+    total = posterior.sum()
+    if total <= 0.0:
+        raise ValueError("edge update produced zero probability mass")
+    return posterior / total
+
+
 def advance_belief(
     belief: np.ndarray,
     observation: int,

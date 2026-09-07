@@ -253,6 +253,13 @@ def compose_hmm_factors(
     if not all(isinstance(factor, HMMModel) for factor in factor_tuple):
         raise TypeError("factors must contain only HMMModel instances")
     coupling_tuple = tuple(FactorCoupling.from_value(value) for value in couplings)
+    edge_factors = tuple(
+        factor.edge_transition_matrices is not None for factor in factor_tuple
+    )
+    if any(edge_factors) and not all(edge_factors):
+        raise ValueError("cannot mix state-emitting and edge-emitting factors")
+    if any(edge_factors) and coupling_tuple:
+        raise ValueError("edge-emitting factors do not support directed couplings")
     token_sizes = tuple(factor.n_tokens for factor in factor_tuple)
     mapping, is_cartesian = _validated_token_map(
         token_map,
@@ -274,8 +281,18 @@ def compose_hmm_factors(
     for cartesian_index, observed_token in enumerate(mapping.reshape(-1)):
         emission[:, observed_token] += cartesian_emission[:, cartesian_index]
 
+    edges = None
+    if all(edge_factors):
+        edges = np.zeros((emission.shape[1], len(initial), len(initial)))
+        for tokens in np.ndindex(token_sizes):
+            kernel = factor_tuple[0].edge_transition_matrices[tokens[0]]
+            for factor, token in zip(factor_tuple[1:], tokens[1:]):
+                kernel = np.kron(kernel, factor.edge_transition_matrices[token])
+            edges[mapping[tokens]] += kernel
+
     return HMMModel(
         initial_distribution=initial,
+        edge_transition_matrices=edges,
         transition_matrix=_joint_transition(factor_tuple, coupling_tuple),
         emission_matrix=emission,
         state_labels=_state_labels(factor_tuple),

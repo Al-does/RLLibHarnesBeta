@@ -376,3 +376,95 @@ sub-token composition and optional directed parent-to-child transition
 couplings. `envs.hmm.factored_model` accepts import-path factor specifications
 for RLlib configuration. Neither changes the task or environment contracts.
 See `docs/factored_hmms.md` for coupling semantics and analysis guidance.
+
+## Edge-emitting models
+
+`HMMModel.edge_transition_matrices` optionally supplies an array with shape
+`(n_tokens, n_states, n_states)`. Its entry `K[x, i, j]` is the joint
+probability of emitting token `x` and arriving in state `j` from source state
+`i`. These non-negative kernels sum over tokens to `transition_matrix`.
+For an edge model, `emission_matrix[i, x]` is the source-state emission
+marginal `sum_j K[x, i, j]`, not an arrival-state likelihood. The model checks
+both equalities and owns immutable copies. Omitting the edge array retains
+all existing state-emitting behavior.
+
+An edge-model reset samples a prior source state from `initial_distribution`,
+then executes one neutral edge using the model kernels. The first returned
+state is that edge's arrival state; the first token is its edge emission.
+The initial exact belief is `normalize(initial_distribution @ K[x])`. Reset
+produces no reward and no previous action. Each later step executes the task's
+edge kernel and returns `normalize(belief @ K_a[x])` over the arrival state.
+The task receives this arrival state as `event.state_after`.
+
+`ActionDecision.edge_transition_matrices` optionally selects the executed
+kernels, with the same token/source/destination shape. Their token sum must
+match the decision's `transition_matrix`. For an edge model, omitting this
+field uses the original model kernels, so a task changing dynamics must
+supply matching kernels. A state-emitting model cannot execute an edge
+decision. Transition diagnostics additionally expose
+`original_edge_transition_matrices` and `executed_edge_transition_matrices`.
+The pure `envs.hmm.condition_edge(belief, kernels, observation)` operation
+implements the normalized edge update. Token presentation confusion is
+applied by summing raw kernels with their visible-token probabilities, so
+scrambled observations still produce an exact agent-conditioned belief.
+Raw belief diagnostics condition on the original edge tokens.
+
+Edge models currently require `delay=0`; delay 1 is explicitly rejected,
+including when beliefs are disabled. Independent all-edge factor composition
+uses Kronecker products of sub-token kernels and sums kernels for merged
+`token_map` outputs. Mixed state/edge factors and directed couplings involving
+edge factors are explicitly unsupported. State-emitting composition, coupling,
+and delay semantics are unchanged.
+
+## Wing domain
+
+`envs.wing.model.wing_model(alpha=0.94, x=0.4)` implements the binary-token,
+three-state edge-emitting Wing process of Equation 9, with uniform prior.
+`envs.wing.model.controlled_kernels(alpha=0.94, x=0.4, strength=0.15)` returns
+shape `(3, 2, 3, 3)` in action/token/source/destination order. Action 0 holds;
+actions 1 and 2 mix identity with forward and backward cyclic arrival-state
+rotations. In row-vector convention the forward permutation satisfies
+`P[i, (i + 1) % 3] = 1`. Controlled kernels are `K_a[x] = K[x] @ C_a`.
+Every action preserves the source-state emission map and has a uniform
+stationary distribution. Parameters `alpha`, `x`, and `strength` lie in
+`[0, 1]`.
+
+`envs.wing.tasks.reward_state.WingRewardTask` infers the number of independent
+identical factors from the supplied model and validates the model against its
+`alpha` and `x`. It accepts `reward_state=0`, `rewarded_factors=(0,)`,
+`alpha=0.94`, `x=0.4`, and `strength=0.15`. Reward is the mean indicator that
+selected factors' arrival states equal `reward_state` (0, 1, or 2). Thus a
+single rewarded factor is not scaled by the total number of factors.
+The action space is `Discrete(3**N)` using C-order Cartesian flattening:
+for two factors `action = 3 * a_0 + a_1`. States and tokens follow the same
+last-factor-fastest ordering. Previous-action features concatenate one
+three-way one-hot per factor, giving width `3*N`.
+
+A primitive two-factor configuration is:
+
+```python
+env_config = {
+    "model": {
+        "factory": "envs.hmm:factored_model",
+        "kwargs": {
+            "factors": [
+                {"factory": "envs.wing.model:wing_model", "kwargs": {"alpha": 0.94, "x": 0.4}},
+                {"factory": "envs.wing.model:wing_model", "kwargs": {"alpha": 0.94, "x": 0.4}},
+            ],
+        },
+    },
+    "task": {
+        "class": "envs.wing.tasks.reward_state:WingRewardTask",
+        "kwargs": {
+            "reward_state": 0,
+            "rewarded_factors": [0, 1],
+            "alpha": 0.94,
+            "x": 0.4,
+            "strength": 0.15,
+        },
+    },
+    "delay": 0,
+    "episode_length": 1024,
+    "seed": 42,
+}
+```
