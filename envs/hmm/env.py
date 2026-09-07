@@ -287,9 +287,6 @@ class HMMEnv(gym.Env):
         if not isinstance(model, HMMModel):
             raise TypeError("the configured model factory must return HMMModel")
         self.model = model
-        if model.edge_transition_matrices is not None and self.config.delay != 0:
-            raise ValueError("edge-emitting models currently require delay=0")
-
         task_class, task_kwargs = _component(
             self.config.task,
             path_key="class",
@@ -341,6 +338,9 @@ class HMMEnv(gym.Env):
         self._raw_token = 0
         self._visible_token: int | None = None
         self._visible_source_token: int | None = None
+        self._pending_edge_matrices: np.ndarray | None = None
+        self._edge_source_belief: np.ndarray | None = None
+        self._raw_edge_source_belief: np.ndarray | None = None
         self._step = 0
         self._current_episode_length = self.config.episode_length
         self._first_episode_pending = True
@@ -506,6 +506,48 @@ class HMMEnv(gym.Env):
         )
 
     def _advance_edge_beliefs(self, matrices: np.ndarray) -> None:
+        if self.config.delay == 1:
+            if (
+                self._pending_edge_matrices is None
+                or self._visible_token is None
+                or self._visible_source_token is None
+            ):
+                raise RuntimeError(
+                    "delay-one edge belief requires a pending visible token"
+                )
+            transition_matrix = matrices.sum(axis=0)
+            if self._belief_tracker is not None:
+                if self._edge_source_belief is None:
+                    raise RuntimeError("delay-one edge source belief is unavailable")
+                visible_matrices = np.einsum(
+                    "xij,xy->yij",
+                    self._pending_edge_matrices,
+                    self._token_confusion,
+                )
+                self._edge_source_belief = condition_edge(
+                    self._edge_source_belief,
+                    visible_matrices,
+                    self._visible_token,
+                )
+                self._belief_tracker.belief = (
+                    self._edge_source_belief @ transition_matrix
+                )
+            if self._raw_belief_tracker is not None:
+                if self._raw_edge_source_belief is None:
+                    raise RuntimeError(
+                        "delay-one raw edge source belief is unavailable"
+                    )
+                self._raw_edge_source_belief = condition_edge(
+                    self._raw_edge_source_belief,
+                    self._pending_edge_matrices,
+                    self._visible_source_token,
+                )
+                self._raw_belief_tracker.belief = (
+                    self._raw_edge_source_belief @ transition_matrix
+                )
+            self._pending_edge_matrices = matrices
+            return
+
         if self._belief_tracker is not None:
             visible_matrices = np.einsum(
                 "xij,xy->yij", matrices, self._token_confusion
@@ -523,6 +565,17 @@ class HMMEnv(gym.Env):
             for tracker in (self._belief_tracker, self._raw_belief_tracker):
                 if tracker is not None:
                     tracker.reset()
+            if self.config.delay == 1:
+                self._pending_edge_matrices = self.model.edge_transition_matrices
+                if self._belief_tracker is not None:
+                    self._edge_source_belief = self._belief_tracker.belief.copy()
+                    self._belief_tracker.predict(self.model.transition_matrix)
+                if self._raw_belief_tracker is not None:
+                    self._raw_edge_source_belief = (
+                        self._raw_belief_tracker.belief.copy()
+                    )
+                    self._raw_belief_tracker.predict(self.model.transition_matrix)
+                return
             self._advance_edge_beliefs(self.model.edge_transition_matrices)
             return
         if self._belief_tracker is not None:

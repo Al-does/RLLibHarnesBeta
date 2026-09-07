@@ -409,12 +409,20 @@ applied by summing raw kernels with their visible-token probabilities, so
 scrambled observations still produce an exact agent-conditioned belief.
 Raw belief diagnostics condition on the original edge tokens.
 
-Edge models currently require `delay=0`; delay 1 is explicitly rejected,
-including when beliefs are disabled. Independent all-edge factor composition
-uses Kronecker products of sub-token kernels and sums kernels for merged
-`token_map` outputs. Mixed state/edge factors and directed couplings involving
-edge factors are explicitly unsupported. State-emitting composition, coupling,
-and delay semantics are unchanged.
+With `delay=1`, reset executes the neutral edge but initially hides its token.
+The decision-time belief is the unconditional arrival belief
+`initial_distribution @ transition_matrix`. After the next action, the
+previous edge token is delivered: the filter conditions the saved source
+belief through the saved edge kernel, then predicts through the transition
+matrix that was just executed. This preserves exact timing for
+action-conditioned edge kernels and presentation scrambling without exposing
+the newly emitted token early.
+
+Independent all-edge factor composition uses Kronecker products of sub-token
+kernels and sums kernels for merged `token_map` outputs. Mixed state/edge
+factors and directed couplings involving edge factors are explicitly
+unsupported. State-emitting composition, coupling, and delay semantics are
+unchanged.
 
 ## Wing domain
 
