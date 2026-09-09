@@ -797,13 +797,14 @@ def test_edge_simulation_matches_joint_token_destination_probabilities():
         np.testing.assert_allclose(counts[action] / visits[action, :, None], expected, atol=0.02)
 
 
-def test_edge_hmm_rllib_env_runner_integration():
+@pytest.mark.parametrize("lifecycle", [{"episode_length": 8}, {"episode_length": None, "reset_emission": False}])
+def test_edge_hmm_rllib_env_runner_integration(lifecycle):
     from ray.rllib.algorithms.ppo import PPOConfig
     from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 
     config = (
         PPOConfig()
-        .environment(HMMEnv, env_config=edge_env_config(episode_length=8))
+        .environment(HMMEnv, env_config=edge_env_config(**lifecycle))
         .env_runners(num_env_runners=0, rollout_fragment_length=16)
         .rl_module(model_config={"fcnet_hiddens": [8]})
     )
@@ -811,5 +812,75 @@ def test_edge_hmm_rllib_env_runner_integration():
     try:
         episodes = runner.sample(num_timesteps=16)
         assert sum(len(episode) for episode in episodes) == 16
+        if lifecycle["episode_length"] is None:
+            first = episodes[0]
+            assert not first.is_terminated and not first.is_truncated
+            assert first.get_infos(-1)["transition_step"] == 15
+            following = runner.sample(num_timesteps=16)[0]
+            assert following.id_ == first.id_
+            assert not following.is_terminated and not following.is_truncated
+            assert following.get_infos(-1)["transition_step"] == 31
+            np.testing.assert_allclose(
+                following.get_infos(0)["belief_current"],
+                first.get_infos(-1)["belief_current"],
+            )
     finally:
         runner.stop()
+
+
+@pytest.mark.parametrize("edge", [False, True])
+def test_no_reset_emission_starts_at_prior_and_clears_history(edge):
+    factory = "edge_model_factory" if edge else "tiny_model_factory"
+    env = HMMEnv(edge_env_config(
+        model={"factory": f"{__name__}:{factory}"},
+        task={"class": f"{__name__}:InlineGuessTask"},
+        reset_emission=False,
+        episode_length=None,
+    ))
+    for _ in range(2):
+        obs, info = env.reset(seed=91)
+        np.testing.assert_array_equal(obs, np.zeros(4))
+        for key in ("raw_token_current", "visible_token_current", "visible_source_token"):
+            assert info[key] is None
+        for key in ("belief_current", "raw_belief_current"):
+            np.testing.assert_array_equal(info[key], env.model.initial_distribution)
+        expected_state = int(np.random.default_rng(np.random.SeedSequence(91, spawn_key=(0,))).choice(
+            env.model.n_states, p=env.model.initial_distribution
+        ))
+        assert info["state_current"] == expected_state
+        belief = env.model.initial_distribution
+        for step in range(1100):
+            obs, _, terminated, truncated, info = env.step(step % 2)
+            assert not terminated and not truncated
+            assert info["raw_token_before"] is None if step == 0 else info["raw_token_before"] in (0, 1)
+            token = info["raw_token_current"]
+            if edge:
+                belief = condition_edge(belief, env.model.edge_transition_matrices, token)
+            else:
+                belief = measure(belief @ env.model.transition_matrix, env.model.emission_matrix, token)
+            np.testing.assert_allclose(info["belief_current"], belief)
+            np.testing.assert_allclose(info["raw_belief_current"], belief)
+            np.testing.assert_array_equal(obs, np.r_[np.eye(2)[token], np.eye(2)[step % 2]])
+
+
+def test_no_reset_emission_does_not_execute_neutral_edge():
+    env = HMMEnv(edge_env_config(
+        model={"factory": f"{__name__}:edge_model_factory", "kwargs": {"deterministic": True}},
+        reset_emission=False,
+    ))
+    _, info = env.reset(seed=1)
+    assert info["state_current"] == 0
+    np.testing.assert_array_equal(info["belief_current"], [1, 0])
+    _, _, _, _, info = env.step(0)
+    assert info["state_before"] == 0 and info["state_after"] == 1
+    assert info["raw_token_before"] is None and info["raw_token_after"] == 0
+
+
+@pytest.mark.parametrize("overrides,error,match", [
+    ({"reset_emission": False, "delay": 1}, ValueError, "reset_emission.*delay"),
+    ({"reset_emission": 0}, TypeError, "reset_emission"),
+    ({"episode_length": None, "randomize_first_episode_length": True}, ValueError, "randomize_first_episode_length"),
+])
+def test_lifecycle_configuration_rejects_unsupported_combinations(overrides, error, match):
+    with pytest.raises(error, match=match):
+        HMMEnv(edge_env_config(**overrides))
