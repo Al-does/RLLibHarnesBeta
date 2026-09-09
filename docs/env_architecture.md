@@ -476,3 +476,15 @@ env_config = {
     "seed": 42,
 }
 ```
+
+## Strata domain
+
+`envs.strata.model.strata_model(alpha=0.97, t0=0.38, t1=0.54)` implements
+the binary-token, three-state edge-emitting Strata process of Equation 10,
+with a uniform prior. `envs.strata.model.controlled_kernels(...)` applies the
+same hold and destination-rotation controls as the Wing domain while
+preserving each source state's token probabilities.
+
+`envs.strata.tasks.reward_state.StrataRewardTask` composes independent Strata
+factors, applies one three-way control per factor, and rewards selected factor
+states on arrival.
