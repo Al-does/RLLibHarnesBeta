@@ -44,7 +44,7 @@ def strata_config(n_factors=2, **task_kwargs):
 
 
 def test_strata_equation_ten():
-    alpha, t0, t1 = 0.97, 0.38, 0.54
+    alpha, t0, t1 = 0.98, 0.30, 0.80
     b = (1.0 - alpha) / 2.0
     model = strata_model(alpha, t0, t1)
     expected = np.array([

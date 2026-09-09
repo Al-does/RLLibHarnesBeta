@@ -15,9 +15,9 @@ def _unit_parameter(value: float, name: str) -> float:
 
 
 def strata_model(
-    alpha: float = 0.97,
-    t0: float = 0.38,
-    t1: float = 0.54,
+    alpha: float = 0.98,
+    t0: float = 0.30,
+    t1: float = 0.80,
 ) -> HMMModel:
     alpha = _unit_parameter(alpha, "alpha")
     t0 = _unit_parameter(t0, "t0")
@@ -46,9 +46,9 @@ def strata_model(
 
 
 def controlled_kernels(
-    alpha: float = 0.97,
-    t0: float = 0.38,
-    t1: float = 0.54,
+    alpha: float = 0.98,
+    t0: float = 0.30,
+    t1: float = 0.80,
     strength: float = 0.15,
 ) -> np.ndarray:
     strength = _unit_parameter(strength, "strength")
