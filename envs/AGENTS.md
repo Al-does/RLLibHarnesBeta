@@ -50,3 +50,31 @@ tests to their owning packages.
 Training loops and supervised workflows do not belong under `envs/`. Keep
 those in experiment leaves; promote a generic supervised helper only after
 another experiment demonstrates reuse.
+
+## Gol public API and lifecycle
+
+`envs.gol` exports `gol_model(variant=3, speed="half", coarse=False,
+initial_distribution=None)`, `controlled_kernels(variant=3, speed="half",
+coarse=False)`, and `GolRewardTask(model=..., variant=3, speed="half",
+coarse=False)`. Variants 2/3 and half/quarter speeds are frozen; only variant 2
+has an exact three-state quotient. Kernels use action/token/source/destination
+axes. The model baseline is action a1; its default prior is stationary under
+uniform independent actions, not the baseline action. The task validates the
+supplied baseline and labels while allowing prior overrides.
+
+Configure `HMMEnv` with model factory `envs.gol:gol_model`, task class
+`envs.gol:GolRewardTask`, matching variant/speed/coarse kwargs, and
+`reset_emission=False`, `episode_length=None`, `delay=0`. Reset samples only
+the prior state, returns zero-padded token/action history, and reports absent
+tokens as `None`; filters start at the prior. Each step jointly samples a
+token and destination, rewards destination E, and filters on the token only.
+Default policy features are token one-hot(2) and previous-action one-hot(4),
+without reward, belief, or hidden state. `STATES`, `COARSE_STATES`, `ACTIONS`,
+and the fine-to-coarse `AGGREGATION` matrix are exported.
+
+The generic lifecycle defaults remain reset emission enabled and horizon 1024.
+An unbounded horizon never truncates and cannot randomize its first length.
+No-reset-emission mode currently requires delay zero for either emission kind.
+
+Targeted verification: `uv run pytest -q envs/gol/tests envs/hmm/tests
+ envs/wing/tests envs/mess3/tests envs/cassandra_machine/tests`.

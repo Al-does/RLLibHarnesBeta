@@ -133,17 +133,24 @@ class HMMEnvConfig:
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     delay: int = 0
-    episode_length: int = 1024
+    episode_length: int | None = 1024
     randomize_first_episode_length: bool = False
     seed: int | None = None
+    reset_emission: bool = True
 
     def __post_init__(self) -> None:
         if self.delay not in (0, 1):
             raise ValueError("delay must be 0 or 1")
-        if self.episode_length <= 0:
+        if self.episode_length is not None and self.episode_length <= 0:
             raise ValueError("episode_length must be positive")
         if not isinstance(self.randomize_first_episode_length, bool):
             raise TypeError("randomize_first_episode_length must be a bool")
+        if self.episode_length is None and self.randomize_first_episode_length:
+            raise ValueError("randomize_first_episode_length requires a finite episode_length")
+        if not isinstance(self.reset_emission, bool):
+            raise TypeError("reset_emission must be a bool")
+        if not self.reset_emission and self.delay != 0:
+            raise ValueError("reset_emission=False requires delay=0")
         if not isinstance(self.model, Mapping):
             raise TypeError("model must be a component configuration")
         if not isinstance(self.task, Mapping):
@@ -188,7 +195,7 @@ class TransitionEvent:
     step: int
     state_before: int
     state_after: int
-    raw_token_before: int
+    raw_token_before: int | None
     raw_token_after: int
     belief_before: np.ndarray | None = None
     belief_after: np.ndarray | None = None
@@ -335,7 +342,7 @@ class HMMEnv(gym.Env):
         self._seed(self.config.seed)
 
         self._state = 0
-        self._raw_token = 0
+        self._raw_token: int | None = None
         self._visible_token: int | None = None
         self._visible_source_token: int | None = None
         self._pending_edge_matrices: np.ndarray | None = None
@@ -476,6 +483,10 @@ class HMMEnv(gym.Env):
 
     def _reset_token_delivery(self) -> None:
         self._raw_token_history.clear()
+        if self._raw_token is None:
+            self._visible_source_token = None
+            self._visible_token = None
+            return
         self._raw_token_history.append(self._raw_token)
         if self.config.delay == 0:
             self._visible_source_token = self._raw_token
@@ -561,6 +572,11 @@ class HMMEnv(gym.Env):
             )
 
     def _reset_beliefs(self) -> None:
+        if not self.config.reset_emission:
+            for tracker in (self._belief_tracker, self._raw_belief_tracker):
+                if tracker is not None:
+                    tracker.reset()
+            return
         if self.model.edge_transition_matrices is not None:
             for tracker in (self._belief_tracker, self._raw_belief_tracker):
                 if tracker is not None:
@@ -600,7 +616,7 @@ class HMMEnv(gym.Env):
         self,
         transition_matrix: np.ndarray,
         *,
-        raw_token_before: int,
+        raw_token_before: int | None,
         raw_token_after: int,
     ) -> None:
         if self._belief_tracker is not None:
@@ -762,7 +778,9 @@ class HMMEnv(gym.Env):
             self._state_rng,
             self.model.initial_distribution,
         )
-        if self.model.edge_transition_matrices is None:
+        if not self.config.reset_emission:
+            self._raw_token = None
+        elif self.model.edge_transition_matrices is None:
             self._raw_token = self._sample(
                 self._emission_rng,
                 self.model.emission_matrix[self._state],
@@ -872,7 +890,10 @@ class HMMEnv(gym.Env):
             )
         )
         self._step += 1
-        truncated = self._step >= self._current_episode_length
+        truncated = (
+            self._current_episode_length is not None
+            and self._step >= self._current_episode_length
+        )
         if truncated:
             self._first_episode_pending = False
             self._needs_reset = True
