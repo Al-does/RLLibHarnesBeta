@@ -16,9 +16,9 @@ class StrataRewardTask:
         model: HMMModel,
         reward_state: int = 0,
         rewarded_factors: tuple[int, ...] = (0,),
-        alpha: float = 0.97,
-        t0: float = 0.38,
-        t1: float = 0.54,
+        alpha: float = 0.98,
+        t0: float = 0.30,
+        t1: float = 0.80,
         strength: float = 0.15,
     ) -> None:
         self.factor_kernels = controlled_kernels(alpha, t0, t1, strength)
